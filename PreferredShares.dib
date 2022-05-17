@@ -1,0 +1,223 @@
+#!csharp
+
+// First let's get out NuGet packages. We do this as a separate step since we don't
+// want to keep re-installing these NuGet packages while we test subsequent steps.
+
+#r "nuget: AlphaVantage.Net.Core, 2.0.1"
+#r "nuget: AlphaVantage.Net.Stocks, 2.0.1"
+
+#!csharp
+
+// First we have our generic System usings...
+using System.Collections.Generic;
+using System.Text.Json;
+using System.Threading.Tasks;
+
+using AlphaVantage.Net.Common.Intervals;
+using AlphaVantage.Net.Common.Size;
+using AlphaVantage.Net.Common.TimeSeries;
+
+using AlphaVantage.Net.Core.Client;
+
+using AlphaVantage.Net.Stocks;
+using AlphaVantage.Net.Stocks.Client;
+
+// Wrap up our setup with the API key.
+String AlphaVantageApiKey = "";
+DateTime EvaluationDate = DateTime.UtcNow;
+
+// Data cache so that we're not constantly hitting the API.
+private static Dictionary<string, StockTimeSeries> TimeSeriesCache = new Dictionary<string, StockTimeSeries>();
+
+#!csharp
+
+public static decimal GetCurrentPrice(StockTimeSeries series, DateTime end)
+{
+    StockAdjustedDataPoint lastDataPoint = series.DataPoints.First(p => p.Time < end) as StockAdjustedDataPoint;
+    decimal adjustedClose = lastDataPoint?.AdjustedClosingPrice ?? 0m;
+    return adjustedClose;
+}
+
+public static decimal GetYearlyDividend(StockTimeSeries series, bool projected = false, int distributionsPerYear = 0)
+{
+    DateTime lastYear = DateTime.UtcNow.AddYears(-1);
+    decimal dividend = decimal.Zero;
+    decimal firstDividend = decimal.Zero;
+
+    bool hasFullYearOfData = false;
+    int monthsBetweenDividend = -1;
+    DateTime lastDividendDate = DateTime.MaxValue;
+    foreach (StockDataPoint point in series.DataPoints)
+    {
+        if (point.Time < lastYear)
+        {
+            hasFullYearOfData = true;
+            break;
+        }
+
+        StockAdjustedDataPoint adjusted = (StockAdjustedDataPoint)point;
+        if (adjusted.DividendAmount > decimal.Zero)
+        {
+            dividend += adjusted.DividendAmount;
+
+            if (monthsBetweenDividend == -1)
+            {
+                if (lastDividendDate == DateTime.MaxValue)
+                {
+                    firstDividend = adjusted.DividendAmount;
+                    lastDividendDate = adjusted.Time;
+                }
+                else
+                {
+                    monthsBetweenDividend = lastDividendDate.Month - adjusted.Time.Month + ((lastDividendDate.Year - adjusted.Time.Year) * 12);
+                }
+            }
+        }
+    }
+
+    if (hasFullYearOfData)
+    {
+        return dividend;
+    }
+    else
+    {
+        return firstDividend * (12 / monthsBetweenDividend);
+    }
+}
+
+public StockTimeSeries GetCachedAdjustedTimeSeries(StocksClient client, string symbol, Interval interval)
+{
+    StockTimeSeries series;
+    if (!TimeSeriesCache.TryGetValue(symbol, out series))
+    {
+        series = client.GetTimeSeriesAsync(symbol, interval, OutputSize.Compact, true).GetAwaiter().GetResult();
+        TimeSeriesCache.Add(symbol, series);
+    }
+
+    return series;
+}
+
+public struct PreferredShare
+{
+    public string Symbol;
+    public decimal Price;
+    public decimal Dividend;
+    public decimal Yield;
+
+    public DateTime CallDate;
+    public decimal CallPrice;
+
+    public decimal CallProtection;
+}
+
+public PreferredShare GetInfoOnPreferredShare(StocksClient client, string symbol, DateTime callDate, decimal callPrice = 25.00m, decimal yieldOverride = 0m)
+{
+    StockTimeSeries series = GetCachedAdjustedTimeSeries(client, symbol, Interval.Monthly);
+    DateTime now = DateTime.UtcNow;
+
+    PreferredShare share = new PreferredShare();
+    share.Symbol = symbol;
+    share.CallDate = callDate;
+    share.CallPrice = callPrice;
+    share.CallProtection = Decimal.Round((share.CallDate - now).Days / 365.0m, 2);
+
+    share.Price = GetCurrentPrice(series, now);
+    share.Dividend = yieldOverride == 0m ? GetYearlyDividend(series) : yieldOverride;
+    share.Yield = Decimal.Round((share.Dividend / share.Price) * 100, 2);
+
+    return share;
+}
+
+public struct Holding
+{
+    public string Symbol;
+    public decimal Shares;
+}
+
+public struct ShareTrade
+{
+    public string Current;
+    public string TradeFor;
+
+    public decimal YieldDifference;
+    public decimal CallProtectionDifference;
+    public decimal NewCallProtection;
+}
+
+public decimal GetRealYield(PreferredShare share, decimal investment)
+{
+    decimal shares = Decimal.Floor(investment / share.Price);
+    decimal newValue = shares * share.Price;
+    return share.Yield * (newValue / investment);
+}
+
+public bool FilterTrade(ShareTrade trade)
+{
+    if (trade.YieldDifference < decimal.Zero)
+    {
+        return trade.CallProtectionDifference > 1.0m && trade.YieldDifference > -0.01m;
+    }
+    else if (trade.CallProtectionDifference < -0.5m && trade.NewCallProtection < 2m)
+    {
+        return false;
+    }
+
+    return true;
+}
+
+public List<ShareTrade> GetPotentialTrades(Holding holding, List<PreferredShare> shares, decimal cash = decimal.Zero)
+{
+    PreferredShare holdingInfo = shares.First(share => share.Symbol == holding.Symbol);
+    decimal value = holding.Shares * holdingInfo.Price;
+    
+    List<ShareTrade> trades = new List<ShareTrade>(shares.Count - 1);
+    foreach (PreferredShare share in shares)
+    {
+        if (share.Symbol == holding.Symbol)
+        {
+            continue;
+        }
+
+        ShareTrade trade = new ShareTrade();
+        trade.Current = holding.Symbol;
+        trade.TradeFor = share.Symbol;
+        trade.YieldDifference = GetRealYield(share, value + cash) - holdingInfo.Yield;
+        trade.CallProtectionDifference = share.CallProtection - holdingInfo.CallProtection;
+        trade.NewCallProtection = share.CallProtection;
+
+        if (FilterTrade(trade))
+        {
+            trades.Add(trade);
+        }
+    }
+
+    return trades;
+}
+
+#!csharp
+
+using (var RawClient = new AlphaVantageClient(AlphaVantageApiKey))
+using (var StockClient = RawClient.Stocks())
+{
+    List<PreferredShare> shares = new List<PreferredShare>();
+    // NRZ
+    shares.Add(GetInfoOnPreferredShare(StockClient, "NRZ-P-A", new DateTime(2024, 08, 15)));
+    shares.Add(GetInfoOnPreferredShare(StockClient, "NRZ-P-B", new DateTime(2024, 08, 15)));
+    shares.Add(GetInfoOnPreferredShare(StockClient, "NRZ-P-C", new DateTime(2024, 02, 15)));
+    shares.Add(GetInfoOnPreferredShare(StockClient, "NRZ-P-D", new DateTime(2024, 11, 15)));
+    // PMT
+    shares.Add(GetInfoOnPreferredShare(StockClient, "PMT-P-A", new DateTime(2024, 03, 15)));
+    shares.Add(GetInfoOnPreferredShare(StockClient, "PMT-P-B", new DateTime(2024, 06, 15)));
+    shares.Add(GetInfoOnPreferredShare(StockClient, "PMT-P-C", new DateTime(2026, 08, 24)));
+
+    List<Holding> test = new List<Holding>();
+    holdings.Add(new Holding{Symbol = "NRZ-P-D", Shares = 100});
+
+
+    shares.OrderBy(share => share.Symbol).Display();
+
+    foreach (Holding holding in holdings)
+    {
+        GetPotentialTrades(holding, shares, cash).Display();
+    }
+}

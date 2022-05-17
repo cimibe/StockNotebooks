@@ -1,0 +1,361 @@
+#!csharp
+
+// First let's get out NuGet packages. We do this as a separate step since we don't
+// want to keep re-installing these NuGet packages while we test subsequent steps.
+
+#r "nuget: AlphaVantage.Net.Core, 2.0.1"
+#r "nuget: AlphaVantage.Net.Stocks, 2.0.1"
+
+#!csharp
+
+// First we have our generic System usings...
+using System.Collections.Generic;
+using System.Text.Json;
+using System.Threading.Tasks;
+
+using AlphaVantage.Net.Common.Intervals;
+using AlphaVantage.Net.Common.Size;
+using AlphaVantage.Net.Common.TimeSeries;
+
+using AlphaVantage.Net.Core.Client;
+
+using AlphaVantage.Net.Stocks;
+using AlphaVantage.Net.Stocks.Client;
+
+// Wrap up our setup with the API key.
+String AlphaVantageApiKey = "";
+DateTime EvaluationDate = DateTime.UtcNow;
+
+// Data cache so that we're not constantly hitting the API.
+private static Dictionary<string, StockTimeSeries> TimeSeriesCache = new Dictionary<string, StockTimeSeries>();
+
+#!csharp
+
+public static decimal AccumulateForRange<T>(this TimeSeriesBase<T> series, DateTime start, DateTime end, Func<T, decimal, decimal> accumulator, decimal baseValue = Decimal.Zero)
+    where T: DataPointBase
+{
+    decimal result = baseValue;
+    bool hasMatched = false; // matches will be continuous, so if we start matching and then stop matching we can bail out early
+    foreach (T point in series.DataPoints)
+    {
+        if (point.Time > start && point.Time < end)
+        {
+            result = accumulator(point, result);
+            hasMatched = true;
+        }
+        else if (hasMatched)
+        {
+            break;
+        }
+    }
+    
+    return result;
+}
+
+public static List<O> ProjectForRange<T, O>(this TimeSeriesBase<T> series, DateTime start, DateTime end, Func<T, O> projection)
+    where T: DataPointBase
+{
+    List<O> result = new List<O>();
+    bool hasMatched = false; // matches will be continuous, so if we start matching and then stop matching we can bail out early
+    foreach (T point in series.DataPoints)
+    {
+        if (point.Time > start && point.Time < end)
+        {
+            result.Add(projection(point));
+            hasMatched = true;
+        }
+        else if (hasMatched)
+        {
+            break;
+        }
+    }
+
+    return result;
+}
+
+public static decimal GetAdjustedCostBasis(StockTimeSeries series, DateTime date, decimal price, decimal distribution = decimal.MinusOne)
+{
+    decimal distributions = distribution == decimal.MinusOne ? GetDividendPerShare(series, date, DateTime.UtcNow, false) : distribution;
+    StockAdjustedDataPoint firstDataPoint = (StockAdjustedDataPoint)series.DataPoints.Last(p => p.Time >= date);
+
+    decimal adjustmentWithoutDividend = Decimal.Round(firstDataPoint.AdjustedClosingPrice + distributions, 4);
+    if (adjustmentWithoutDividend == firstDataPoint.ClosingPrice)
+    {
+        return price;
+    }
+    else
+    {
+        decimal splitAdjustment = adjustmentWithoutDividend / firstDataPoint.ClosingPrice;
+        return Decimal.Round(splitAdjustment * price, 4);
+    }
+}
+
+public static decimal GetCurrentPrice(StockTimeSeries series, DateTime end)
+{
+    StockAdjustedDataPoint lastDataPoint = series.DataPoints.First(p => p.Time < end) as StockAdjustedDataPoint;
+    decimal adjustedClose = lastDataPoint?.AdjustedClosingPrice ?? 0m;
+    return adjustedClose;
+}
+
+public static decimal GetCurrentShares(StockTimeSeries series, DateTime start, DateTime end, decimal initialShareCount)
+{
+    StockAdjustedDataPoint firstDataPoint = (StockAdjustedDataPoint)series.DataPoints.First(p => p.Time >= start);
+    return decimal.Round((firstDataPoint.AdjustedClosingPrice / firstDataPoint.ClosingPrice) * initialShareCount, 0);
+}
+
+public static decimal GetDividendPerShare(StockTimeSeries series, DateTime start, DateTime end, bool includeFirstPeriod)
+{
+    DateTime adjustedStart;
+    Interval period = series.Interval;
+    if (!includeFirstPeriod)
+    {
+        switch (period)
+        {
+            case Interval.Daily:
+                adjustedStart = start.AddDays(1);
+                break;
+            case Interval.Weekly:
+                adjustedStart = start.AddDays(7);
+                break;
+            case Interval.Monthly:
+                adjustedStart = start.AddMonths(1);
+                break;
+            default:
+                adjustedStart = start;
+                break;
+        }
+    }
+    else
+    {
+        adjustedStart = start;
+    }
+
+    decimal dividend = decimal.Zero;
+    foreach (StockDataPoint point in series.DataPoints)
+    {
+        if (point.Time < adjustedStart)
+        {
+            break;
+        }
+        else if (point.Time > end)
+        {
+            continue;
+        }
+
+        StockAdjustedDataPoint adjusted = (StockAdjustedDataPoint)point;
+        decimal factorForSplit = decimal.One;
+        decimal adjustedCloseWithoutDividend = adjusted.AdjustedClosingPrice + dividend;
+        if (adjustedCloseWithoutDividend != adjusted.ClosingPrice)
+        {
+            factorForSplit = adjustedCloseWithoutDividend / adjusted.ClosingPrice;
+        }
+
+        dividend += factorForSplit * adjusted.DividendAmount;
+    }
+    
+    return dividend;
+}
+
+public static decimal GetYearlyDividend(StockTimeSeries series, bool projected = false, int distributionsPerYear = 0)
+{
+    DateTime lastYear = DateTime.UtcNow.AddYears(-1);
+    decimal dividend = decimal.Zero;
+    decimal firstDividend = decimal.Zero;
+
+    bool hasFullYearOfData = false;
+    int monthsBetweenDividend = -1;
+    DateTime lastDividendDate = DateTime.MaxValue;
+    foreach (StockDataPoint point in series.DataPoints)
+    {
+        if (point.Time < lastYear)
+        {
+            hasFullYearOfData = true;
+            break;
+        }
+
+        StockAdjustedDataPoint adjusted = (StockAdjustedDataPoint)point;
+        if (adjusted.DividendAmount > decimal.Zero)
+        {
+            dividend += adjusted.DividendAmount;
+
+            if (monthsBetweenDividend == -1)
+            {
+                if (lastDividendDate == DateTime.MaxValue)
+                {
+                    firstDividend = adjusted.DividendAmount;
+                    lastDividendDate = adjusted.Time;
+                }
+                else
+                {
+                    monthsBetweenDividend = lastDividendDate.Month - adjusted.Time.Month + ((lastDividendDate.Year - adjusted.Time.Year) * 12);
+                }
+            }
+        }
+    }
+
+    if (hasFullYearOfData)
+    {
+        return dividend;
+    }
+    else if (projected)
+    {
+        return firstDividend * (12 / monthsBetweenDividend);
+    }
+    else
+    {
+        return dividend;
+    }
+}
+
+public struct PurchaseResult
+{
+    public string Symbol;
+    public DateTime DateOfPurchase;
+    public decimal CostBasis;
+    public decimal Price;
+    public decimal Shares;
+    public decimal Value;
+
+    public decimal PercentChange;
+    public decimal ChangeInValue;
+
+    public decimal Distributions;
+    public decimal Yield;
+
+    public decimal TotalGain;
+}
+
+public struct PositionResult
+{
+    public string Symbol;
+    public decimal Allocation;
+    public decimal Cost;
+    public decimal Shares;
+    public decimal Value;
+
+    public decimal PercentChange;
+    public decimal ChangeInValue;
+
+    public decimal Distributions;
+    public decimal Yield;
+
+    public decimal TotalGain;
+}
+
+public StockTimeSeries GetCachedAdjustedTimeSeries(StocksClient client, string symbol, Interval interval)
+{
+    StockTimeSeries series;
+    if (!TimeSeriesCache.TryGetValue(symbol, out series))
+    {
+        series = client.GetTimeSeriesAsync(symbol, interval, OutputSize.Compact, true).GetAwaiter().GetResult();
+        TimeSeriesCache.Add(symbol, series);
+    }
+
+    return series;
+}
+
+public PurchaseResult GetPurchaseResult(StocksClient client, string symbol, DateTime date, decimal price, decimal shares)
+{
+    StockTimeSeries series = GetCachedAdjustedTimeSeries(client, symbol, Interval.Monthly);
+    DateTime now = DateTime.UtcNow;
+
+    PurchaseResult result = new PurchaseResult();
+    result.Symbol = symbol;
+    result.DateOfPurchase = date.Date;
+    result.CostBasis = GetAdjustedCostBasis(series, date, price);
+
+    result.Shares = GetCurrentShares(series, date, now, shares);
+    
+    decimal currentPrice = GetCurrentPrice(series, now);
+    result.Price = currentPrice;
+    result.PercentChange = Decimal.Round((currentPrice / price) * 100m, 2) - 100.0m;
+    result.Value = currentPrice * result.Shares;
+    result.ChangeInValue = result.Value - (price * result.Shares);
+
+    result.Distributions = Decimal.Round(GetDividendPerShare(series, date, now, false) * result.Shares, 2);
+    result.Yield = Decimal.Round((GetYearlyDividend(series, true) / result.Price) * 100, 2);
+
+    result.TotalGain = result.Distributions + result.ChangeInValue;
+
+    return result;
+}
+
+public List<PositionResult> GetPositionResults(List<PurchaseResult> purchases)
+{
+    List<PositionResult> results = new List<PositionResult>();
+    decimal totalValue = 0m;
+
+    ILookup<string, PurchaseResult> purchaseLookup = purchases.ToLookup(p => p.Symbol);
+    foreach (var position in purchaseLookup)
+    {
+        PositionResult result = new PositionResult();
+        result.Symbol = position.Key;
+
+        foreach (PurchaseResult purchase in position)
+        {
+            result.Cost += purchase.CostBasis * purchase.Shares;
+            result.Shares += purchase.Shares;
+            result.Value += purchase.Value;
+            result.Distributions += purchase.Distributions;
+            result.Yield = purchase.Yield;
+        }
+
+        result.ChangeInValue = result.Value - result.Cost;
+        result.PercentChange = Decimal.Round((result.ChangeInValue / result.Cost) * 100, 2);
+        result.TotalGain = result.ChangeInValue;
+
+        results.Add(result);
+        totalValue += result.Value;
+    }
+
+    for (int i = 0; i < results.Count; i++)
+    {
+        PositionResult allocatedResult = results[i];
+        allocatedResult.Allocation = Decimal.Round((allocatedResult.Value / totalValue) * 100, 2);
+        results[i] = allocatedResult;
+    }
+
+    return results;
+}
+
+public struct PortfolioResult
+{
+    public decimal Value;
+    public decimal Dividend;
+    public decimal Yield;
+    public decimal PercentGain;
+    public decimal TotalGain;
+}
+
+public PortfolioResult GetPortfolioResult(List<PositionResult> positions)
+{
+    PortfolioResult result = new PortfolioResult();
+    foreach (PositionResult position in positions)
+    {
+        result.Value += position.Value;
+        result.TotalGain += position.TotalGain;
+        result.Yield += (position.Allocation / 100) * position.Yield; 
+    }
+
+    result.Yield = Decimal.Round(result.Yield, 2);
+    result.Dividend = Decimal.Round((result.Yield / 100) * result.Value, 2);
+    result.PercentGain = Decimal.Round((result.TotalGain / (result.Value - result.TotalGain)) * 100.0m, 2);
+    return result;
+}
+
+#!csharp
+
+using (var RawClient = new AlphaVantageClient(AlphaVantageApiKey))
+using (var StockClient = RawClient.Stocks())
+{
+    List<PurchaseResult> test = new List<PurchaseResult>();
+    purchases.Add(GetPurchaseResult(StockClient, "HYT", new DateTime(2022, 01, 01), 10.00m, 100m));
+    purchases.Add(GetPurchaseResult(StockClient, "HYT", new DateTime(2022, 01, 01), 10.00m, 100m));
+
+    List<PositionResult> positions = GetPositionResults(purchases).OrderBy(p => p.Allocation).Reverse().ToList();
+
+    PortfolioResult portfolio = GetPortfolioResult(positions);
+    
+    positions.Display();
+    portfolio.Display();
+}
